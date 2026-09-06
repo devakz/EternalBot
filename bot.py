@@ -544,7 +544,10 @@ async def help_command(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🎉 Giveaways",
-        value="`/giveaway` — start a giveaway with a prize, duration and number of winners",
+        value=(
+            "`/giveaway` — opens a form to customize the embed, plus optional required/blocked roles\n"
+            "Buttons: **Enter Giveaway** and **Participants** (see who's in)"
+        ),
         inline=False
     )
     embed.add_field(
@@ -764,32 +767,99 @@ async def remove_member(interaction: discord.Interaction, member: discord.Member
 # ===========================================================
 
 class GiveawayView(discord.ui.View):
-    def __init__(self, prize: str, winners_count: int, duration_seconds: int, host: discord.Member):
+    def __init__(self, prize: str, winners_count: int, duration_seconds: int, host: discord.Member,
+                 ends_at, required_role_id: int = None, blocked_role_id: int = None):
         super().__init__(timeout=duration_seconds)
         self.prize = prize
         self.winners_count = winners_count
         self.host = host
+        self.ends_at = ends_at
+        self.required_role_id = required_role_id
+        self.blocked_role_id = blocked_role_id
         self.entrants = set()
         self.message = None
+        self.updater_task = None
 
-        button = discord.ui.Button(label="🎉 Enter Giveaway", style=discord.ButtonStyle.blurple)
-        button.callback = self.enter_callback
-        self.add_item(button)
+        enter_button = discord.ui.Button(label="🎉 Enter Giveaway", style=discord.ButtonStyle.blurple)
+        enter_button.callback = self.enter_callback
+        self.add_item(enter_button)
+
+        participants_button = discord.ui.Button(label="👥 Participants", style=discord.ButtonStyle.secondary)
+        participants_button.callback = self.view_participants_callback
+        self.add_item(participants_button)
 
     async def enter_callback(self, interaction: discord.Interaction):
-        if interaction.user.id in self.entrants:
-            self.entrants.discard(interaction.user.id)
+        member = interaction.user
+
+        if self.blocked_role_id and any(r.id == self.blocked_role_id for r in member.roles):
+            await interaction.response.send_message("❌ You're not allowed to enter this giveaway.", ephemeral=True)
+            return
+
+        if self.required_role_id and not any(r.id == self.required_role_id for r in member.roles):
+            await interaction.response.send_message(
+                f"❌ You need the <@&{self.required_role_id}> role to enter this giveaway.", ephemeral=True
+            )
+            return
+
+        if member.id in self.entrants:
+            self.entrants.discard(member.id)
             await interaction.response.send_message("❌ You left the giveaway.", ephemeral=True)
         else:
-            self.entrants.add(interaction.user.id)
+            self.entrants.add(member.id)
             await interaction.response.send_message("✅ You entered the giveaway! Click again to leave.", ephemeral=True)
 
+        await self.refresh_embed()
+
+    async def view_participants_callback(self, interaction: discord.Interaction):
+        if not self.entrants:
+            await interaction.response.send_message("No one has entered yet.", ephemeral=True)
+            return
+        entrants_list = list(self.entrants)
+        mentions = "\n".join(f"<@{uid}>" for uid in entrants_list[:50])
+        extra = f"\n...and {len(entrants_list) - 50} more" if len(entrants_list) > 50 else ""
+        await interaction.response.send_message(f"**Participants ({len(entrants_list)}):**\n{mentions}{extra}", ephemeral=True)
+
+    async def refresh_embed(self):
+        if not self.message or not self.message.embeds:
+            return
+        embed = self.message.embeds[0]
+        for i, field in enumerate(embed.fields):
+            if field.name == "Entries":
+                embed.set_field_at(i, name="Entries", value=str(len(self.entrants)), inline=field.inline)
+            elif field.name == "Time Remaining":
+                embed.set_field_at(i, name="Time Remaining", value=discord.utils.format_dt(self.ends_at, "R"), inline=field.inline)
+        try:
+            await self.message.edit(embed=embed)
+        except discord.HTTPException:
+            pass
+
+    async def update_loop(self):
+        # Keeps "Time Remaining" and "Entries" fresh even if no one clicks the button
+        try:
+            while not self.is_finished():
+                await asyncio.sleep(30)
+                if self.is_finished():
+                    break
+                await self.refresh_embed()
+        except asyncio.CancelledError:
+            pass
+
     async def on_timeout(self):
+        if self.updater_task:
+            self.updater_task.cancel()
+
         for child in self.children:
             child.disabled = True
-        if self.message:
+
+        if self.message and self.message.embeds:
+            embed = self.message.embeds[0]
+            for i, field in enumerate(embed.fields):
+                if field.name == "Time Remaining":
+                    embed.set_field_at(i, name="Time Remaining", value="Ended", inline=field.inline)
+                elif field.name == "Entries":
+                    embed.set_field_at(i, name="Entries", value=str(len(self.entrants)), inline=field.inline)
             try:
-                await self.message.edit(view=self)
+                await self.message.edit(embed=embed, view=self)
             except discord.HTTPException:
                 pass
 
@@ -817,34 +887,95 @@ class GiveawayView(discord.ui.View):
         await channel.send(embed=result_embed)
 
 
+class GiveawayEmbedModal(discord.ui.Modal, title="Customize Giveaway Embed"):
+    def __init__(self, prize: str, duration_minutes: int, winners_count: int, host: discord.Member,
+                 required_role: discord.Role = None, blocked_role: discord.Role = None):
+        super().__init__()
+        self.prize = prize
+        self.duration_minutes = duration_minutes
+        self.winners_count = winners_count
+        self.host = host
+        self.required_role = required_role
+        self.blocked_role = blocked_role
+
+        self.title_input = discord.ui.TextInput(
+            label="Title", required=False, max_length=256, default="🎉 GIVEAWAY 🎉"
+        )
+        self.description_input = discord.ui.TextInput(
+            label="Description", style=discord.TextStyle.paragraph, required=False, max_length=4000,
+            default=f"Prize: **{prize}**\nClick the button below to enter!"
+        )
+        self.color_input = discord.ui.TextInput(label="Color (hex, e.g. #5865F2)", required=False, max_length=7)
+        self.image_input = discord.ui.TextInput(label="Image URL", required=False)
+        self.thumbnail_input = discord.ui.TextInput(label="Thumbnail URL", required=False)
+
+        for item in [self.title_input, self.description_input, self.color_input, self.image_input, self.thumbnail_input]:
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ends_at = discord.utils.utcnow() + timedelta(minutes=self.duration_minutes)
+
+        embed = discord.Embed(
+            title=self.title_input.value or None,
+            description=self.description_input.value or None,
+            color=parse_color(self.color_input.value)
+        )
+        if self.image_input.value:
+            embed.set_image(url=self.image_input.value)
+        if self.thumbnail_input.value:
+            embed.set_thumbnail(url=self.thumbnail_input.value)
+
+        embed.add_field(name="Winners", value=str(self.winners_count))
+        embed.add_field(name="Time Remaining", value=discord.utils.format_dt(ends_at, "R"))
+        embed.add_field(name="Entries", value="0")
+        embed.add_field(name="Hosted by", value=self.host.mention)
+        if self.required_role:
+            embed.add_field(name="Required Role", value=self.required_role.mention)
+        if self.blocked_role:
+            embed.add_field(name="Blocked Role", value=self.blocked_role.mention)
+        embed.set_footer(text="Click the button to enter — click again to leave")
+
+        view = GiveawayView(
+            prize=self.prize,
+            winners_count=self.winners_count,
+            duration_seconds=self.duration_minutes * 60,
+            host=self.host,
+            ends_at=ends_at,
+            required_role_id=self.required_role.id if self.required_role else None,
+            blocked_role_id=self.blocked_role.id if self.blocked_role else None,
+        )
+        await interaction.response.send_message(embed=embed, view=view)
+        view.message = await interaction.original_response()
+        view.updater_task = asyncio.create_task(view.update_loop())
+
+
 @bot.tree.command(name="giveaway", description="Start a giveaway")
 @app_commands.describe(
     prize="What you're giving away",
     duration_minutes="How long the giveaway lasts, in minutes",
-    winners="Number of winners (default 1)"
+    winners="Number of winners (default 1)",
+    required_role="Only members with this role can enter (optional)",
+    blocked_role="Members with this role cannot enter (optional)"
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def giveaway(
     interaction: discord.Interaction,
     prize: str,
     duration_minutes: app_commands.Range[int, 1, 10080],
-    winners: app_commands.Range[int, 1, 20] = 1
+    winners: app_commands.Range[int, 1, 20] = 1,
+    required_role: discord.Role = None,
+    blocked_role: discord.Role = None
 ):
-    ends_at = discord.utils.utcnow() + timedelta(minutes=duration_minutes)
-
-    embed = discord.Embed(
-        title="🎉 Giveaway 🎉",
-        description=f"Prize: **{prize}**\nClick the button below to enter!",
-        color=discord.Color.blurple()
+    await interaction.response.send_modal(
+        GiveawayEmbedModal(
+            prize=prize,
+            duration_minutes=duration_minutes,
+            winners_count=winners,
+            host=interaction.user,
+            required_role=required_role,
+            blocked_role=blocked_role
+        )
     )
-    embed.add_field(name="Winners", value=str(winners))
-    embed.add_field(name="Ends", value=discord.utils.format_dt(ends_at, "R"))
-    embed.add_field(name="Hosted by", value=interaction.user.mention)
-    embed.set_footer(text="Click the button to enter — click again to leave")
-
-    view = GiveawayView(prize=prize, winners_count=winners, duration_seconds=duration_minutes * 60, host=interaction.user)
-    await interaction.response.send_message(embed=embed, view=view)
-    view.message = await interaction.original_response()
 
 
 @giveaway.error
