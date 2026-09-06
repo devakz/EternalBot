@@ -24,6 +24,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 MESSAGE_LINK_RE = re.compile(r"channels/(\d+)/(\d+)/(\d+)")
 
+# message_id -> GiveawayView (in-memory only; lost on restart)
+active_giveaways = {}
+
 # ---------------------------------------------------------
 # SIMPLE JSON STORAGE — WARNINGS
 # ---------------------------------------------------------
@@ -93,6 +96,52 @@ async def resolve_message_from_url(interaction: discord.Interaction, url: str):
         return None, "❌ That message doesn't have an embed."
 
     return message, None
+
+
+async def rename_message_buttons(message: discord.Message, labels: list):
+    """Renames buttons on a message, in order. Entries in `labels` that are
+    None/empty are left unchanged. Returns how many buttons were renamed."""
+    labels = list(labels)
+    applied = 0
+
+    live_view = active_giveaways.get(message.id)
+    if live_view:
+        idx = 0
+        for child in live_view.children:
+            if isinstance(child, discord.ui.Button):
+                if idx < len(labels) and labels[idx]:
+                    child.label = labels[idx]
+                    applied += 1
+                idx += 1
+        if applied:
+            await message.edit(view=live_view)
+        return applied
+
+    if not message.components:
+        return 0
+
+    new_view = discord.ui.View(timeout=None)
+    idx = 0
+    for row in message.components:
+        for comp in row.children:
+            if isinstance(comp, discord.Button):
+                new_label = comp.label
+                if idx < len(labels) and labels[idx]:
+                    new_label = labels[idx]
+                    applied += 1
+                new_view.add_item(discord.ui.Button(
+                    style=comp.style,
+                    label=new_label,
+                    emoji=comp.emoji,
+                    custom_id=comp.custom_id,
+                    url=comp.url,
+                    disabled=comp.disabled,
+                ))
+                idx += 1
+
+    if applied:
+        await message.edit(view=new_view)
+    return applied
 
 
 @bot.event
@@ -546,6 +595,8 @@ async def help_command(interaction: discord.Interaction):
         name="🎉 Giveaways",
         value=(
             "`/giveaway` — opens a form to customize the embed, plus optional required/blocked roles\n"
+            "`/edit-giveaway` — change prize, winners, roles or time on an active giveaway\n"
+            "`/giveaway-reroll` — pick new winner(s)\n"
             "Buttons: **Enter Giveaway** and **Participants** (see who's in)"
         ),
         inline=False
@@ -559,7 +610,8 @@ async def help_command(interaction: discord.Interaction):
         name="🎨 Embeds",
         value=(
             "`/embed` — opens a form to build an embed (title, description, color, image, thumbnail)\n"
-            "`/edit-embed` — paste a message link to edit ANY embed I sent (regular embed, ticket, or giveaway)"
+            "`/edit-embed` — paste a message link to edit ANY embed I sent (regular embed, ticket, or giveaway); "
+            "you can also rename its buttons right from this command"
         ),
         inline=False
     )
@@ -603,9 +655,10 @@ async def embed_command(interaction: discord.Interaction):
 
 
 class EditEmbedModal(discord.ui.Modal, title="Edit Embed"):
-    def __init__(self, target_message: discord.Message):
+    def __init__(self, target_message: discord.Message, button_labels: list = None):
         super().__init__()
         self.target_message = target_message
+        self.button_labels = button_labels or []
         existing = target_message.embeds[0]
         current_color = f"#{existing.color.value:06X}" if existing.color else None
 
@@ -630,18 +683,33 @@ class EditEmbedModal(discord.ui.Modal, title="Edit Embed"):
         embed.set_thumbnail(url=self.thumbnail_input.value) if self.thumbnail_input.value else embed.set_thumbnail(url=None)
 
         await self.target_message.edit(embed=embed)
-        await interaction.response.send_message("✅ Embed updated.")
+
+        note = ""
+        if any(self.button_labels):
+            renamed = await rename_message_buttons(self.target_message, self.button_labels)
+            if renamed:
+                note = f"\n🔘 Renamed {renamed} button(s)."
+            else:
+                note = "\n⚠️ No buttons found on that message to rename."
+
+        await interaction.response.send_message("✅ Embed updated." + note)
 
 
 @bot.tree.command(name="edit-embed", description="Edit any embed I sent by pasting its message link")
-@app_commands.describe(url="Right-click the message with the embed → Copy Message Link")
+@app_commands.describe(
+    url="Right-click the message with the embed → Copy Message Link",
+    button_1_label="Rename the message's first button (optional)",
+    button_2_label="Rename the message's second button (optional)"
+)
 @app_commands.checks.has_permissions(manage_messages=True)
-async def edit_embed(interaction: discord.Interaction, url: str):
+async def edit_embed(interaction: discord.Interaction, url: str, button_1_label: str = None, button_2_label: str = None):
     message, error = await resolve_message_from_url(interaction, url)
     if error:
         await interaction.response.send_message(error, ephemeral=True)
         return
-    await interaction.response.send_modal(EditEmbedModal(message))
+    await interaction.response.send_modal(
+        EditEmbedModal(message, button_labels=[button_1_label, button_2_label])
+    )
 
 
 @edit_embed.error
@@ -766,10 +834,15 @@ async def remove_member(interaction: discord.Interaction, member: discord.Member
 # GIVEAWAYS
 # ===========================================================
 
+def format_giveaway_description(prize: str) -> str:
+    return f"Prize: **{prize}**\nClick the button below to enter!"
+
+
 class GiveawayView(discord.ui.View):
-    def __init__(self, prize: str, winners_count: int, duration_seconds: int, host: discord.Member,
+    def __init__(self, prize: str, winners_count: int, host: discord.Member,
                  ends_at, required_role_id: int = None, blocked_role_id: int = None):
-        super().__init__(timeout=duration_seconds)
+        # timeout=None: we manage ending ourselves (so duration can be edited later)
+        super().__init__(timeout=None)
         self.prize = prize
         self.winners_count = winners_count
         self.host = host
@@ -779,6 +852,8 @@ class GiveawayView(discord.ui.View):
         self.entrants = set()
         self.message = None
         self.updater_task = None
+        self.end_task = None
+        self.ended = False
 
         enter_button = discord.ui.Button(label="🎉 Enter Giveaway", style=discord.ButtonStyle.blurple)
         enter_button.callback = self.enter_callback
@@ -836,15 +911,37 @@ class GiveawayView(discord.ui.View):
     async def update_loop(self):
         # Keeps "Time Remaining" and "Entries" fresh even if no one clicks the button
         try:
-            while not self.is_finished():
+            while not self.ended:
                 await asyncio.sleep(30)
-                if self.is_finished():
+                if self.ended:
                     break
                 await self.refresh_embed()
         except asyncio.CancelledError:
             pass
 
-    async def on_timeout(self):
+    def schedule_end(self):
+        """(Re)schedules the giveaway's end based on the current self.ends_at.
+        Safe to call again after the duration is edited."""
+        if self.end_task:
+            self.end_task.cancel()
+        self.end_task = asyncio.create_task(self._wait_and_end())
+
+    async def _wait_and_end(self):
+        try:
+            while True:
+                remaining = (self.ends_at - discord.utils.utcnow()).total_seconds()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(remaining, 30))
+            await self.end_giveaway()
+        except asyncio.CancelledError:
+            pass
+
+    async def end_giveaway(self):
+        if self.ended:
+            return
+        self.ended = True
+
         if self.updater_task:
             self.updater_task.cancel()
 
@@ -863,28 +960,29 @@ class GiveawayView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
+        self.stop()
+
         channel = self.message.channel if self.message else None
         if not channel:
             return
 
+        await channel.send(embed=self.build_winner_embed())
+
+    def build_winner_embed(self) -> discord.Embed:
         if not self.entrants:
-            result_embed = discord.Embed(
+            return discord.Embed(
                 title="🎉 Giveaway Ended",
                 description=f"No one entered the giveaway for **{self.prize}**.",
                 color=discord.Color.red()
             )
-            await channel.send(embed=result_embed)
-            return
-
         winners_count = min(self.winners_count, len(self.entrants))
         winners = random.sample(list(self.entrants), winners_count)
         mentions = ", ".join(f"<@{w}>" for w in winners)
-        result_embed = discord.Embed(
+        return discord.Embed(
             title="🎉 Giveaway Ended",
             description=f"Congratulations {mentions}! You won **{self.prize}**!",
             color=discord.Color.green()
         )
-        await channel.send(embed=result_embed)
 
 
 class GiveawayEmbedModal(discord.ui.Modal, title="Customize Giveaway Embed"):
@@ -903,7 +1001,7 @@ class GiveawayEmbedModal(discord.ui.Modal, title="Customize Giveaway Embed"):
         )
         self.description_input = discord.ui.TextInput(
             label="Description", style=discord.TextStyle.paragraph, required=False, max_length=4000,
-            default=f"Prize: **{prize}**\nClick the button below to enter!"
+            default=format_giveaway_description(prize)
         )
         self.color_input = discord.ui.TextInput(label="Color (hex, e.g. #5865F2)", required=False, max_length=7)
         self.image_input = discord.ui.TextInput(label="Image URL", required=False)
@@ -938,7 +1036,6 @@ class GiveawayEmbedModal(discord.ui.Modal, title="Customize Giveaway Embed"):
         view = GiveawayView(
             prize=self.prize,
             winners_count=self.winners_count,
-            duration_seconds=self.duration_minutes * 60,
             host=self.host,
             ends_at=ends_at,
             required_role_id=self.required_role.id if self.required_role else None,
@@ -946,7 +1043,9 @@ class GiveawayEmbedModal(discord.ui.Modal, title="Customize Giveaway Embed"):
         )
         await interaction.response.send_message(embed=embed, view=view)
         view.message = await interaction.original_response()
+        active_giveaways[view.message.id] = view
         view.updater_task = asyncio.create_task(view.update_loop())
+        view.schedule_end()
 
 
 @bot.tree.command(name="giveaway", description="Start a giveaway")
@@ -978,12 +1077,143 @@ async def giveaway(
     )
 
 
-@giveaway.error
-async def giveaway_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"⚠️ Error: {error}", ephemeral=True)
+async def resolve_giveaway_from_url(interaction: discord.Interaction, url: str):
+    match = MESSAGE_LINK_RE.search(url)
+    if not match:
+        return None, None, "❌ That doesn't look like a valid message link. Right-click the giveaway message → **Copy Message Link**."
+
+    guild_id, channel_id, message_id = map(int, match.groups())
+    if guild_id != interaction.guild.id:
+        return None, None, "❌ That message is from a different server."
+
+    view = active_giveaways.get(message_id)
+    if not view:
+        return None, None, (
+            "❌ I couldn't find that giveaway in memory. This happens if the bot restarted "
+            "since it was created, or the link doesn't point to a giveaway message."
+        )
+
+    channel = interaction.guild.get_channel(channel_id)
+    if channel is None:
+        return None, None, "❌ I can't find that channel."
+
+    try:
+        message = await channel.fetch_message(message_id)
+    except (discord.NotFound, discord.Forbidden):
+        return None, None, "❌ Couldn't fetch that message."
+
+    return view, message, None
+
+
+@bot.tree.command(name="edit-giveaway", description="Edit an active giveaway (prize, winners, roles, time)")
+@app_commands.describe(
+    url="Link to the giveaway message",
+    prize="New prize (optional)",
+    winners="New number of winners (optional)",
+    add_minutes="Add minutes to the remaining time — use a negative number to reduce it (optional)",
+    required_role="Set the required role (optional)",
+    blocked_role="Set the blocked role (optional)"
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def edit_giveaway(
+    interaction: discord.Interaction,
+    url: str,
+    prize: str = None,
+    winners: app_commands.Range[int, 1, 20] = None,
+    add_minutes: int = None,
+    required_role: discord.Role = None,
+    blocked_role: discord.Role = None
+):
+    view, message, error = await resolve_giveaway_from_url(interaction, url)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    if view.ended:
+        await interaction.response.send_message("❌ This giveaway has already ended — use `/giveaway-reroll` instead.", ephemeral=True)
+        return
+
+    if prize is None and winners is None and add_minutes is None and required_role is None and blocked_role is None:
+        await interaction.response.send_message("⚠️ Provide at least one field to change.", ephemeral=True)
+        return
+
+    changes = []
+    embed = message.embeds[0]
+
+    if prize:
+        view.prize = prize
+        embed.description = format_giveaway_description(prize)
+        changes.append(f"Prize → **{prize}**")
+
+    if winners:
+        view.winners_count = winners
+        changes.append(f"Winners → {winners}")
+
+    if add_minutes:
+        view.ends_at += timedelta(minutes=add_minutes)
+        view.schedule_end()
+        action = "Added" if add_minutes > 0 else "Removed"
+        changes.append(f"{action} {abs(add_minutes)} minute(s) — new end time updated")
+
+    if required_role:
+        view.required_role_id = required_role.id
+        changes.append(f"Required role → {required_role.mention}")
+
+    if blocked_role:
+        view.blocked_role_id = blocked_role.id
+        changes.append(f"Blocked role → {blocked_role.mention}")
+
+    field_names = [f.name for f in embed.fields]
+    for i, field in enumerate(embed.fields):
+        if field.name == "Winners" and winners:
+            embed.set_field_at(i, name="Winners", value=str(view.winners_count), inline=field.inline)
+        elif field.name == "Time Remaining":
+            embed.set_field_at(i, name="Time Remaining", value=discord.utils.format_dt(view.ends_at, "R"), inline=field.inline)
+        elif field.name == "Required Role" and required_role:
+            embed.set_field_at(i, name="Required Role", value=required_role.mention, inline=field.inline)
+        elif field.name == "Blocked Role" and blocked_role:
+            embed.set_field_at(i, name="Blocked Role", value=blocked_role.mention, inline=field.inline)
+
+    if required_role and "Required Role" not in field_names:
+        embed.add_field(name="Required Role", value=required_role.mention)
+    if blocked_role and "Blocked Role" not in field_names:
+        embed.add_field(name="Blocked Role", value=blocked_role.mention)
+
+    await message.edit(embed=embed)
+    await interaction.response.send_message("✅ Giveaway updated:\n" + "\n".join(changes))
+
+
+@bot.tree.command(name="giveaway-reroll", description="Reroll the winner(s) of a giveaway")
+@app_commands.describe(url="Link to the giveaway message")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def giveaway_reroll(interaction: discord.Interaction, url: str):
+    view, message, error = await resolve_giveaway_from_url(interaction, url)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    if not view.entrants:
+        await interaction.response.send_message("❌ No participants to reroll from.", ephemeral=True)
+        return
+
+    winners_count = min(view.winners_count, len(view.entrants))
+    winners = random.sample(list(view.entrants), winners_count)
+    mentions = ", ".join(f"<@{w}>" for w in winners)
+    embed = discord.Embed(
+        title="🔁 Giveaway Rerolled",
+        description=f"New winner(s) for **{view.prize}**: {mentions}",
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+for cmd in [giveaway, edit_giveaway, giveaway_reroll]:
+    async def _giveaway_err(interaction: discord.Interaction, error, _cmd=cmd):
+        if isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"⚠️ Error: {error}", ephemeral=True)
+    cmd.error(_giveaway_err)
 
 
 bot.run(TOKEN)
