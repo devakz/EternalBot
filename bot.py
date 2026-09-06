@@ -649,7 +649,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="🎉 Giveaways",
         value=(
-            "`/giveaway` — opens a form for everything: prize, duration, winners, required/blocked roles, then appearance\n"
+            "`/giveaway` — form for prize/duration/winners/roles, then a button opens the appearance form\n"
             "`/edit-giveaway` — change prize, winners, roles (accepts several, comma separated) or time on an active giveaway\n"
             "`/giveaway-reroll` — pick new winner(s)\n"
             "Buttons: **Enter Giveaway** and **Participants** (see who's in)"
@@ -664,7 +664,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="🎨 Embeds",
         value=(
-            "`/embed` — opens a form to build an embed, then another to optionally add up to 2 buttons (with links)\n"
+            "`/embed` — opens a form to build an embed with up to 5 link buttons\n"
             "`/edit-embed` — paste a message link to edit ANY embed I sent (regular embed, ticket, or giveaway); "
             "you can also rename its buttons right from this command"
         ),
@@ -678,16 +678,45 @@ async def help_command(interaction: discord.Interaction):
 # EMBED BUILDER + UNIVERSAL EDITOR (URL-BASED)
 # ===========================================================
 
+def parse_buttons(text: str, max_buttons: int = 5):
+    """Parses lines like 'Label | https://url' into a list of (label, url). Returns (buttons, skipped_labels)."""
+    buttons = []
+    skipped = []
+    if not text:
+        return buttons, skipped
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "|" not in line:
+            continue
+        label, url = line.split("|", 1)
+        label = label.strip()[:80]
+        url = url.strip()
+        if not label or not url:
+            continue
+        if url.startswith("http://") or url.startswith("https://"):
+            if len(buttons) < max_buttons:
+                buttons.append((label, url))
+        else:
+            skipped.append(label)
+    return buttons, skipped
+
+
 class EmbedModal(discord.ui.Modal, title="Create Embed"):
     def __init__(self):
         super().__init__()
         self.title_input = discord.ui.TextInput(label="Title", required=False, max_length=256)
         self.description_input = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, required=False, max_length=4000)
         self.color_input = discord.ui.TextInput(label="Color (hex, e.g. #5865F2)", required=False, max_length=7)
-        self.image_input = discord.ui.TextInput(label="Image URL", required=False)
-        self.thumbnail_input = discord.ui.TextInput(label="Thumbnail URL", required=False)
+        self.images_input = discord.ui.TextInput(
+            label="Image URL / Thumbnail URL", style=discord.TextStyle.paragraph, required=False,
+            placeholder="Line 1: image URL\nLine 2: thumbnail URL"
+        )
+        self.buttons_input = discord.ui.TextInput(
+            label="Buttons — Label | URL, one per line (up to 5)", style=discord.TextStyle.paragraph, required=False,
+            placeholder="Website | https://example.com\nDocs | https://docs.example.com"
+        )
 
-        for item in [self.title_input, self.description_input, self.color_input, self.image_input, self.thumbnail_input]:
+        for item in [self.title_input, self.description_input, self.color_input, self.images_input, self.buttons_input]:
             self.add_item(item)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -696,44 +725,21 @@ class EmbedModal(discord.ui.Modal, title="Create Embed"):
             description=self.description_input.value or None,
             color=parse_color(self.color_input.value)
         )
-        if self.image_input.value:
-            embed.set_image(url=self.image_input.value)
-        if self.thumbnail_input.value:
-            embed.set_thumbnail(url=self.thumbnail_input.value)
+
+        image_lines = [l.strip() for l in (self.images_input.value or "").splitlines() if l.strip()]
+        if len(image_lines) >= 1:
+            embed.set_image(url=image_lines[0])
+        if len(image_lines) >= 2:
+            embed.set_thumbnail(url=image_lines[1])
+
         embed.set_footer(text=f"Created by {interaction.user}", icon_url=interaction.user.display_avatar.url)
 
-        # Chain into a second form to optionally add buttons
-        await interaction.response.send_modal(EmbedButtonsModal(embed))
-
-
-class EmbedButtonsModal(discord.ui.Modal, title="Add Buttons (optional)"):
-    def __init__(self, embed: discord.Embed):
-        super().__init__()
-        self.embed = embed
-        self.button1_label = discord.ui.TextInput(label="Button 1 label", required=False, max_length=80)
-        self.button1_url = discord.ui.TextInput(label="Button 1 URL", required=False, placeholder="https://...")
-        self.button2_label = discord.ui.TextInput(label="Button 2 label", required=False, max_length=80)
-        self.button2_url = discord.ui.TextInput(label="Button 2 URL", required=False, placeholder="https://...")
-
-        for item in [self.button1_label, self.button1_url, self.button2_label, self.button2_url]:
-            self.add_item(item)
-
-    async def on_submit(self, interaction: discord.Interaction):
+        buttons, skipped = parse_buttons(self.buttons_input.value, max_buttons=5)
         view = discord.ui.View(timeout=None)
-        skipped = []
+        for label, url in buttons:
+            view.add_item(discord.ui.Button(label=label, url=url, style=discord.ButtonStyle.link))
 
-        def try_add(label, url):
-            if not label or not url:
-                return
-            if url.startswith("http://") or url.startswith("https://"):
-                view.add_item(discord.ui.Button(label=label, url=url, style=discord.ButtonStyle.link))
-            else:
-                skipped.append(label)
-
-        try_add(self.button1_label.value, self.button1_url.value)
-        try_add(self.button2_label.value, self.button2_url.value)
-
-        kwargs = {"embed": self.embed}
+        kwargs = {"embed": embed}
         if len(view.children) > 0:
             kwargs["view"] = view
         await interaction.response.send_message(**kwargs)
@@ -748,6 +754,7 @@ class EmbedButtonsModal(discord.ui.Modal, title="Add Buttons (optional)"):
 @bot.tree.command(name="embed", description="Create a custom embed using an interactive form")
 async def embed_command(interaction: discord.Interaction):
     await interaction.response.send_modal(EmbedModal())
+
 
 
 class EditEmbedModal(discord.ui.Modal, title="Edit Embed"):
@@ -1127,16 +1134,44 @@ class GiveawayDetailsModal(discord.ui.Modal, title="Create Giveaway — Details"
         required_roles = parse_roles(interaction.guild, self.required_roles_input.value)
         blocked_roles = parse_roles(interaction.guild, self.blocked_roles_input.value)
 
-        await interaction.response.send_modal(
-            GiveawayAppearanceModal(
+        await interaction.response.send_message(
+            "✅ Details saved! Click below to customize how the giveaway looks.",
+            view=GiveawayContinueView(
                 prize=self.prize_input.value,
                 duration_minutes=duration_minutes,
                 winners_count=winners_count,
                 host=self.host,
                 required_role_ids=[r.id for r in required_roles],
                 blocked_role_ids=[r.id for r in blocked_roles],
+            ),
+            ephemeral=True
+        )
+
+
+class GiveawayContinueView(discord.ui.View):
+    def __init__(self, prize: str, duration_minutes: int, winners_count: int, host: discord.Member,
+                 required_role_ids: list, blocked_role_ids: list):
+        super().__init__(timeout=300)
+        self.prize = prize
+        self.duration_minutes = duration_minutes
+        self.winners_count = winners_count
+        self.host = host
+        self.required_role_ids = required_role_ids
+        self.blocked_role_ids = blocked_role_ids
+
+    @discord.ui.button(label="🎨 Customize Appearance", style=discord.ButtonStyle.primary)
+    async def continue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(
+            GiveawayAppearanceModal(
+                prize=self.prize,
+                duration_minutes=self.duration_minutes,
+                winners_count=self.winners_count,
+                host=self.host,
+                required_role_ids=self.required_role_ids,
+                blocked_role_ids=self.blocked_role_ids,
             )
         )
+        self.stop()
 
 
 class GiveawayAppearanceModal(discord.ui.Modal, title="Create Giveaway — Appearance"):
