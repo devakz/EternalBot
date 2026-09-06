@@ -1,5 +1,7 @@
 import os
+import re
 import json
+import random
 import asyncio
 import discord
 from discord import app_commands
@@ -18,6 +20,8 @@ intents.message_content = True
 intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+MESSAGE_LINK_RE = re.compile(r"channels/(\d+)/(\d+)/(\d+)")
 
 # ---------------------------------------------------------
 # SIMPLE JSON STORAGE — WARNINGS
@@ -59,6 +63,37 @@ def parse_color(value: str, fallback=discord.Color.blurple()) -> discord.Color:
         return fallback
 
 
+async def resolve_message_from_url(interaction: discord.Interaction, url: str):
+    """Parses a Discord message link and returns (message, error_text)."""
+    match = MESSAGE_LINK_RE.search(url)
+    if not match:
+        return None, "❌ That doesn't look like a valid message link. Right-click the embed message → **Copy Message Link**."
+
+    guild_id, channel_id, message_id = map(int, match.groups())
+
+    if guild_id != interaction.guild.id:
+        return None, "❌ That message is from a different server."
+
+    channel = interaction.guild.get_channel(channel_id)
+    if channel is None:
+        return None, "❌ I can't find that channel (maybe I don't have access to it)."
+
+    try:
+        message = await channel.fetch_message(message_id)
+    except discord.NotFound:
+        return None, "❌ Message not found — double-check the link."
+    except discord.Forbidden:
+        return None, "❌ I don't have permission to view that channel."
+
+    if message.author.id != bot.user.id:
+        return None, "❌ I can only edit embeds that I sent myself."
+
+    if not message.embeds:
+        return None, "❌ That message doesn't have an embed."
+
+    return message, None
+
+
 @bot.event
 async def on_ready():
     try:
@@ -73,7 +108,6 @@ async def on_ready():
 async def on_connect():
     bot.add_view(TicketOpenView())
     bot.add_view(TicketCloseView())
-    bot.add_view(EmbedView())
     bot.add_view(VerifyView())
 
 
@@ -502,10 +536,14 @@ async def help_command(interaction: discord.Interaction):
         name="🎫 Tickets",
         value=(
             "`/ticket-panel` — post the ticket panel\n"
-            "`/edit-ticket` — edit the current ticket's embed (form)\n"
             "`/add-member` · `/remove-member` — manage ticket access\n"
             "Buttons inside a ticket: **Close Ticket**, **Claim Ticket**"
         ),
+        inline=False
+    )
+    embed.add_field(
+        name="🎉 Giveaways",
+        value="`/giveaway` — start a giveaway with a prize, duration and number of winners",
         inline=False
     )
     embed.add_field(
@@ -515,7 +553,10 @@ async def help_command(interaction: discord.Interaction):
     )
     embed.add_field(
         name="🎨 Embeds",
-        value="`/embed` — opens a form to build an embed (title, description, color, image, thumbnail). Every embed gets an **Edit** button.",
+        value=(
+            "`/embed` — opens a form to build an embed (title, description, color, image, thumbnail)\n"
+            "`/edit-embed` — paste a message link to edit ANY embed I sent (regular embed, ticket, or giveaway)"
+        ),
         inline=False
     )
     embed.set_footer(text="Type / in the chat to see each command's parameters")
@@ -523,36 +564,17 @@ async def help_command(interaction: discord.Interaction):
 
 
 # ===========================================================
-# MODERN EMBED BUILDER (MODAL-BASED)
+# EMBED BUILDER + UNIVERSAL EDITOR (URL-BASED)
 # ===========================================================
 
-class EmbedModal(discord.ui.Modal):
-    def __init__(self, existing_embed: discord.Embed = None):
-        super().__init__(title="Edit Embed" if existing_embed else "Create Embed")
-        self.editing = existing_embed is not None
-
-        current_color = f"#{existing_embed.color.value:06X}" if existing_embed and existing_embed.color else None
-
-        self.title_input = discord.ui.TextInput(
-            label="Title", required=False, max_length=256,
-            default=existing_embed.title if existing_embed else None
-        )
-        self.description_input = discord.ui.TextInput(
-            label="Description", style=discord.TextStyle.paragraph, required=False, max_length=4000,
-            default=existing_embed.description if existing_embed else None
-        )
-        self.color_input = discord.ui.TextInput(
-            label="Color (hex, e.g. #5865F2)", required=False, max_length=7,
-            default=current_color
-        )
-        self.image_input = discord.ui.TextInput(
-            label="Image URL", required=False,
-            default=existing_embed.image.url if existing_embed and existing_embed.image else None
-        )
-        self.thumbnail_input = discord.ui.TextInput(
-            label="Thumbnail URL", required=False,
-            default=existing_embed.thumbnail.url if existing_embed and existing_embed.thumbnail else None
-        )
+class EmbedModal(discord.ui.Modal, title="Create Embed"):
+    def __init__(self):
+        super().__init__()
+        self.title_input = discord.ui.TextInput(label="Title", required=False, max_length=256)
+        self.description_input = discord.ui.TextInput(label="Description", style=discord.TextStyle.paragraph, required=False, max_length=4000)
+        self.color_input = discord.ui.TextInput(label="Color (hex, e.g. #5865F2)", required=False, max_length=7)
+        self.image_input = discord.ui.TextInput(label="Image URL", required=False)
+        self.thumbnail_input = discord.ui.TextInput(label="Thumbnail URL", required=False)
 
         for item in [self.title_input, self.description_input, self.color_input, self.image_input, self.thumbnail_input]:
             self.add_item(item)
@@ -568,26 +590,62 @@ class EmbedModal(discord.ui.Modal):
         if self.thumbnail_input.value:
             embed.set_thumbnail(url=self.thumbnail_input.value)
         embed.set_footer(text=f"Created by {interaction.user}", icon_url=interaction.user.display_avatar.url)
-
-        if self.editing and interaction.message is not None:
-            await interaction.response.edit_message(embed=embed, view=EmbedView())
-        else:
-            await interaction.response.send_message(embed=embed, view=EmbedView())
-
-
-class EmbedView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Edit", emoji="✏️", style=discord.ButtonStyle.secondary, custom_id="embed_edit_button")
-    async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        existing = interaction.message.embeds[0] if interaction.message.embeds else None
-        await interaction.response.send_modal(EmbedModal(existing_embed=existing))
+        await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="embed", description="Create a custom embed using an interactive form")
 async def embed_command(interaction: discord.Interaction):
     await interaction.response.send_modal(EmbedModal())
+
+
+class EditEmbedModal(discord.ui.Modal, title="Edit Embed"):
+    def __init__(self, target_message: discord.Message):
+        super().__init__()
+        self.target_message = target_message
+        existing = target_message.embeds[0]
+        current_color = f"#{existing.color.value:06X}" if existing.color else None
+
+        self.title_input = discord.ui.TextInput(label="Title", required=False, max_length=256, default=existing.title)
+        self.description_input = discord.ui.TextInput(
+            label="Description", style=discord.TextStyle.paragraph, required=False, max_length=4000,
+            default=existing.description
+        )
+        self.color_input = discord.ui.TextInput(label="Color (hex)", required=False, max_length=7, default=current_color)
+        self.image_input = discord.ui.TextInput(label="Image URL", required=False, default=existing.image.url if existing.image else None)
+        self.thumbnail_input = discord.ui.TextInput(label="Thumbnail URL", required=False, default=existing.thumbnail.url if existing.thumbnail else None)
+
+        for item in [self.title_input, self.description_input, self.color_input, self.image_input, self.thumbnail_input]:
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        embed = self.target_message.embeds[0]
+        embed.title = self.title_input.value or None
+        embed.description = self.description_input.value or None
+        embed.color = parse_color(self.color_input.value, fallback=embed.color or discord.Color.blurple())
+        embed.set_image(url=self.image_input.value) if self.image_input.value else embed.set_image(url=None)
+        embed.set_thumbnail(url=self.thumbnail_input.value) if self.thumbnail_input.value else embed.set_thumbnail(url=None)
+
+        await self.target_message.edit(embed=embed)
+        await interaction.response.send_message("✅ Embed updated.")
+
+
+@bot.tree.command(name="edit-embed", description="Edit any embed I sent by pasting its message link")
+@app_commands.describe(url="Right-click the message with the embed → Copy Message Link")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def edit_embed(interaction: discord.Interaction, url: str):
+    message, error = await resolve_message_from_url(interaction, url)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    await interaction.response.send_modal(EditEmbedModal(message))
+
+
+@edit_embed.error
+async def edit_embed_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"⚠️ Error: {error}", ephemeral=True)
 
 
 # ===========================================================
@@ -674,59 +732,6 @@ async def ticket_panel(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=TicketOpenView())
 
 
-class TicketEditModal(discord.ui.Modal, title="Edit Ticket Embed"):
-    def __init__(self, target_message: discord.Message):
-        super().__init__()
-        self.target_message = target_message
-        existing = target_message.embeds[0] if target_message.embeds else None
-        current_color = f"#{existing.color.value:06X}" if existing and existing.color else None
-
-        self.title_input = discord.ui.TextInput(label="Title", required=False, default=existing.title if existing else None)
-        self.description_input = discord.ui.TextInput(
-            label="Description", style=discord.TextStyle.paragraph, required=False,
-            default=existing.description if existing else None
-        )
-        self.color_input = discord.ui.TextInput(label="Color (hex)", required=False, default=current_color)
-
-        self.add_item(self.title_input)
-        self.add_item(self.description_input)
-        self.add_item(self.color_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        embed = self.target_message.embeds[0] if self.target_message.embeds else discord.Embed()
-        if self.title_input.value:
-            embed.title = self.title_input.value
-        if self.description_input.value:
-            embed.description = self.description_input.value
-        if self.color_input.value:
-            embed.color = parse_color(self.color_input.value, fallback=embed.color or discord.Color.blurple())
-
-        await self.target_message.edit(embed=embed)
-        await interaction.response.send_message("✅ Ticket embed updated.")
-
-
-@bot.tree.command(name="edit-ticket", description="Edit the current ticket's embed using a form")
-async def edit_ticket(interaction: discord.Interaction):
-    if not is_ticket_channel(interaction.channel):
-        await interaction.response.send_message("❌ This command only works inside a ticket channel.", ephemeral=True)
-        return
-    if not is_staff_member(interaction.user):
-        await interaction.response.send_message("❌ Only staff can edit the ticket.", ephemeral=True)
-        return
-
-    target_message = None
-    async for msg in interaction.channel.history(limit=50, oldest_first=True):
-        if msg.author == bot.user and msg.embeds:
-            target_message = msg
-            break
-
-    if not target_message:
-        await interaction.response.send_message("❌ Couldn't find the ticket embed in this channel.", ephemeral=True)
-        return
-
-    await interaction.response.send_modal(TicketEditModal(target_message))
-
-
 @bot.tree.command(name="add-member", description="Add a member to the current ticket")
 @app_commands.describe(member="Member to add")
 async def add_member(interaction: discord.Interaction, member: discord.Member):
@@ -751,6 +756,102 @@ async def remove_member(interaction: discord.Interaction, member: discord.Member
         return
     await interaction.channel.set_permissions(member, overwrite=None)
     await interaction.response.send_message(f"✅ {member.mention} was removed from the ticket.")
+
+
+# ===========================================================
+# GIVEAWAYS
+# ===========================================================
+
+class GiveawayView(discord.ui.View):
+    def __init__(self, prize: str, winners_count: int, duration_seconds: int, host: discord.Member):
+        super().__init__(timeout=duration_seconds)
+        self.prize = prize
+        self.winners_count = winners_count
+        self.host = host
+        self.entrants = set()
+        self.message = None
+
+        button = discord.ui.Button(label="🎉 Enter Giveaway", style=discord.ButtonStyle.blurple)
+        button.callback = self.enter_callback
+        self.add_item(button)
+
+    async def enter_callback(self, interaction: discord.Interaction):
+        if interaction.user.id in self.entrants:
+            self.entrants.discard(interaction.user.id)
+            await interaction.response.send_message("❌ You left the giveaway.", ephemeral=True)
+        else:
+            self.entrants.add(interaction.user.id)
+            await interaction.response.send_message("✅ You entered the giveaway! Click again to leave.", ephemeral=True)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+        channel = self.message.channel if self.message else None
+        if not channel:
+            return
+
+        if not self.entrants:
+            result_embed = discord.Embed(
+                title="🎉 Giveaway Ended",
+                description=f"No one entered the giveaway for **{self.prize}**.",
+                color=discord.Color.red()
+            )
+            await channel.send(embed=result_embed)
+            return
+
+        winners_count = min(self.winners_count, len(self.entrants))
+        winners = random.sample(list(self.entrants), winners_count)
+        mentions = ", ".join(f"<@{w}>" for w in winners)
+        result_embed = discord.Embed(
+            title="🎉 Giveaway Ended",
+            description=f"Congratulations {mentions}! You won **{self.prize}**!",
+            color=discord.Color.green()
+        )
+        await channel.send(embed=result_embed)
+
+
+@bot.tree.command(name="giveaway", description="Start a giveaway")
+@app_commands.describe(
+    prize="What you're giving away",
+    duration_minutes="How long the giveaway lasts, in minutes",
+    winners="Number of winners (default 1)"
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def giveaway(
+    interaction: discord.Interaction,
+    prize: str,
+    duration_minutes: app_commands.Range[int, 1, 10080],
+    winners: app_commands.Range[int, 1, 20] = 1
+):
+    ends_at = discord.utils.utcnow() + discord.timedelta(minutes=duration_minutes)
+
+    embed = discord.Embed(
+        title="🎉 Giveaway 🎉",
+        description=f"Prize: **{prize}**\nClick the button below to enter!",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name="Winners", value=str(winners))
+    embed.add_field(name="Ends", value=discord.utils.format_dt(ends_at, "R"))
+    embed.add_field(name="Hosted by", value=interaction.user.mention)
+    embed.set_footer(text="Click the button to enter — click again to leave")
+
+    view = GiveawayView(prize=prize, winners_count=winners, duration_seconds=duration_minutes * 60, host=interaction.user)
+    await interaction.response.send_message(embed=embed, view=view)
+    view.message = await interaction.original_response()
+
+
+@giveaway.error
+async def giveaway_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"⚠️ Error: {error}", ephemeral=True)
 
 
 bot.run(TOKEN)
