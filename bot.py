@@ -67,6 +67,31 @@ def parse_color(value: str, fallback=discord.Color.blurple()) -> discord.Color:
         return fallback
 
 
+ROLE_MENTION_RE = re.compile(r"<@&(\d+)>")
+
+
+def parse_roles(guild: discord.Guild, text: str):
+    """Parses a comma-separated list of role mentions, IDs, or exact names into discord.Role objects."""
+    if not text:
+        return []
+    roles = []
+    for part in re.split(r"[,\n]", text):
+        part = part.strip()
+        if not part:
+            continue
+        role = None
+        mention_match = ROLE_MENTION_RE.fullmatch(part)
+        if mention_match:
+            role = guild.get_role(int(mention_match.group(1)))
+        elif part.isdigit():
+            role = guild.get_role(int(part))
+        else:
+            role = discord.utils.get(guild.roles, name=part)
+        if role and role not in roles:
+            roles.append(role)
+    return roles
+
+
 async def resolve_message_from_url(interaction: discord.Interaction, url: str):
     """Parses a Discord message link and returns (message, error_text)."""
     match = MESSAGE_LINK_RE.search(url)
@@ -219,13 +244,14 @@ async def remove_timeout(interaction: discord.Interaction, member: discord.Membe
     await interaction.response.send_message(f"🔊 **{member}** is no longer timed out.")
 
 
-@bot.tree.command(name="clear", description="Delete a number of messages from the channel")
-@app_commands.describe(amount="Number of messages to delete (max 100)")
+@bot.tree.command(name="clear", description="Delete messages from the channel (leave amount empty to delete ALL messages)")
+@app_commands.describe(amount="Number of messages to delete (leave empty to delete every message in the channel)")
 @app_commands.checks.has_permissions(manage_messages=True)
-async def clear(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]):
+async def clear(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 1000] = None):
     await interaction.response.defer()
     deleted = await interaction.channel.purge(limit=amount)
-    embed = discord.Embed(description=f"🧹 {len(deleted)} messages deleted by {interaction.user.mention}.", color=discord.Color.blurple())
+    note = "all messages" if amount is None else f"{len(deleted)} messages"
+    embed = discord.Embed(description=f"🧹 Deleted {note} — action by {interaction.user.mention}.", color=discord.Color.blurple())
     await interaction.followup.send(embed=embed)
 
 
@@ -479,16 +505,45 @@ class VerifyView(discord.ui.View):
             )
 
 
+class PanelEmbedModal(discord.ui.Modal):
+    """Generic customization form used by panel commands (ticket, verification, etc)."""
+    def __init__(self, modal_title: str, default_title: str, default_description: str, view_factory):
+        super().__init__(title=modal_title)
+        self.view_factory = view_factory
+        self.title_input = discord.ui.TextInput(label="Title", required=False, max_length=256, default=default_title)
+        self.description_input = discord.ui.TextInput(
+            label="Description", style=discord.TextStyle.paragraph, required=False, max_length=4000,
+            default=default_description
+        )
+        self.color_input = discord.ui.TextInput(label="Color (hex, e.g. #5865F2)", required=False, max_length=7)
+        self.image_input = discord.ui.TextInput(label="Image URL", required=False)
+        self.thumbnail_input = discord.ui.TextInput(label="Thumbnail URL", required=False)
+
+        for item in [self.title_input, self.description_input, self.color_input, self.image_input, self.thumbnail_input]:
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title=self.title_input.value or None,
+            description=self.description_input.value or None,
+            color=parse_color(self.color_input.value, fallback=discord.Color.blurple())
+        )
+        if self.image_input.value:
+            embed.set_image(url=self.image_input.value)
+        if self.thumbnail_input.value:
+            embed.set_thumbnail(url=self.thumbnail_input.value)
+        await interaction.response.send_message(embed=embed, view=self.view_factory())
+
+
 @bot.tree.command(name="verify-panel", description="Post the verification panel")
 @app_commands.checks.has_permissions(manage_roles=True)
 async def verify_panel(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🔒 Server Verification",
-        description="Click the button below to verify yourself and unlock full access to the server.",
-        color=discord.Color.green()
-    )
-    embed.set_footer(text="This helps keep out bots and raid accounts.")
-    await interaction.response.send_message(embed=embed, view=VerifyView())
+    await interaction.response.send_modal(PanelEmbedModal(
+        "Customize Verification Panel",
+        "🔒 Server Verification",
+        "Click the button below to verify yourself and unlock full access to the server.",
+        VerifyView
+    ))
 
 
 @verify_panel.error
@@ -575,7 +630,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="🔐 Security",
         value=(
-            "`/verify-panel` — post the verification panel\n"
+            "`/verify-panel` — opens a form to customize the verification panel\n"
             "`/account-age` — check if an account looks suspicious\n"
             "`/recent-joins` — spot possible raids\n"
             "`/lockdown` · `/unlock-all` — server-wide emergency lock"
@@ -585,7 +640,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="🎫 Tickets",
         value=(
-            "`/ticket-panel` — post the ticket panel\n"
+            "`/ticket-panel` — opens a form to customize the ticket panel\n"
             "`/add-member` · `/remove-member` — manage ticket access\n"
             "Buttons inside a ticket: **Close Ticket**, **Claim Ticket**"
         ),
@@ -594,8 +649,8 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="🎉 Giveaways",
         value=(
-            "`/giveaway` — opens a form to customize the embed, plus optional required/blocked roles\n"
-            "`/edit-giveaway` — change prize, winners, roles or time on an active giveaway\n"
+            "`/giveaway` — opens a form for everything: prize, duration, winners, required/blocked roles, then appearance\n"
+            "`/edit-giveaway` — change prize, winners, roles (accepts several, comma separated) or time on an active giveaway\n"
             "`/giveaway-reroll` — pick new winner(s)\n"
             "Buttons: **Enter Giveaway** and **Participants** (see who's in)"
         ),
@@ -609,7 +664,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="🎨 Embeds",
         value=(
-            "`/embed` — opens a form to build an embed (title, description, color, image, thumbnail)\n"
+            "`/embed` — opens a form to build an embed, then another to optionally add up to 2 buttons (with links)\n"
             "`/edit-embed` — paste a message link to edit ANY embed I sent (regular embed, ticket, or giveaway); "
             "you can also rename its buttons right from this command"
         ),
@@ -646,7 +701,48 @@ class EmbedModal(discord.ui.Modal, title="Create Embed"):
         if self.thumbnail_input.value:
             embed.set_thumbnail(url=self.thumbnail_input.value)
         embed.set_footer(text=f"Created by {interaction.user}", icon_url=interaction.user.display_avatar.url)
-        await interaction.response.send_message(embed=embed)
+
+        # Chain into a second form to optionally add buttons
+        await interaction.response.send_modal(EmbedButtonsModal(embed))
+
+
+class EmbedButtonsModal(discord.ui.Modal, title="Add Buttons (optional)"):
+    def __init__(self, embed: discord.Embed):
+        super().__init__()
+        self.embed = embed
+        self.button1_label = discord.ui.TextInput(label="Button 1 label", required=False, max_length=80)
+        self.button1_url = discord.ui.TextInput(label="Button 1 URL", required=False, placeholder="https://...")
+        self.button2_label = discord.ui.TextInput(label="Button 2 label", required=False, max_length=80)
+        self.button2_url = discord.ui.TextInput(label="Button 2 URL", required=False, placeholder="https://...")
+
+        for item in [self.button1_label, self.button1_url, self.button2_label, self.button2_url]:
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        view = discord.ui.View(timeout=None)
+        skipped = []
+
+        def try_add(label, url):
+            if not label or not url:
+                return
+            if url.startswith("http://") or url.startswith("https://"):
+                view.add_item(discord.ui.Button(label=label, url=url, style=discord.ButtonStyle.link))
+            else:
+                skipped.append(label)
+
+        try_add(self.button1_label.value, self.button1_url.value)
+        try_add(self.button2_label.value, self.button2_url.value)
+
+        kwargs = {"embed": self.embed}
+        if len(view.children) > 0:
+            kwargs["view"] = view
+        await interaction.response.send_message(**kwargs)
+
+        if skipped:
+            await interaction.followup.send(
+                f"⚠️ Skipped button(s) with an invalid URL (must start with http:// or https://): {', '.join(skipped)}",
+                ephemeral=True
+            )
 
 
 @bot.tree.command(name="embed", description="Create a custom embed using an interactive form")
@@ -796,12 +892,20 @@ class TicketOpenView(discord.ui.View):
 @bot.tree.command(name="ticket-panel", description="Send the ticket opening panel")
 @app_commands.checks.has_permissions(manage_channels=True)
 async def ticket_panel(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="📩 Support",
-        description="Click the button below to open a support ticket.",
-        color=discord.Color.blurple()
-    )
-    await interaction.response.send_message(embed=embed, view=TicketOpenView())
+    await interaction.response.send_modal(PanelEmbedModal(
+        "Customize Ticket Panel",
+        "📩 Support",
+        "Click the button below to open a support ticket.",
+        TicketOpenView
+    ))
+
+
+@ticket_panel.error
+async def ticket_panel_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message("❌ You don't have permission to use this command.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"⚠️ Error: {error}", ephemeral=True)
 
 
 @bot.tree.command(name="add-member", description="Add a member to the current ticket")
@@ -840,15 +944,15 @@ def format_giveaway_description(prize: str) -> str:
 
 class GiveawayView(discord.ui.View):
     def __init__(self, prize: str, winners_count: int, host: discord.Member,
-                 ends_at, required_role_id: int = None, blocked_role_id: int = None):
+                 ends_at, required_role_ids: list = None, blocked_role_ids: list = None):
         # timeout=None: we manage ending ourselves (so duration can be edited later)
         super().__init__(timeout=None)
         self.prize = prize
         self.winners_count = winners_count
         self.host = host
         self.ends_at = ends_at
-        self.required_role_id = required_role_id
-        self.blocked_role_id = blocked_role_id
+        self.required_role_ids = set(required_role_ids or [])
+        self.blocked_role_ids = set(blocked_role_ids or [])
         self.entrants = set()
         self.message = None
         self.updater_task = None
@@ -865,14 +969,16 @@ class GiveawayView(discord.ui.View):
 
     async def enter_callback(self, interaction: discord.Interaction):
         member = interaction.user
+        member_role_ids = {r.id for r in member.roles}
 
-        if self.blocked_role_id and any(r.id == self.blocked_role_id for r in member.roles):
+        if self.blocked_role_ids and member_role_ids & self.blocked_role_ids:
             await interaction.response.send_message("❌ You're not allowed to enter this giveaway.", ephemeral=True)
             return
 
-        if self.required_role_id and not any(r.id == self.required_role_id for r in member.roles):
+        if self.required_role_ids and not (member_role_ids & self.required_role_ids):
+            role_mentions = ", ".join(f"<@&{rid}>" for rid in self.required_role_ids)
             await interaction.response.send_message(
-                f"❌ You need the <@&{self.required_role_id}> role to enter this giveaway.", ephemeral=True
+                f"❌ You need one of these roles to enter: {role_mentions}", ephemeral=True
             )
             return
 
@@ -985,16 +1091,64 @@ class GiveawayView(discord.ui.View):
         )
 
 
-class GiveawayEmbedModal(discord.ui.Modal, title="Customize Giveaway Embed"):
+class GiveawayDetailsModal(discord.ui.Modal, title="Create Giveaway — Details"):
+    def __init__(self, host: discord.Member):
+        super().__init__()
+        self.host = host
+        self.prize_input = discord.ui.TextInput(label="Prize", max_length=256)
+        self.duration_input = discord.ui.TextInput(label="Duration (minutes)", max_length=10, placeholder="e.g. 60")
+        self.winners_input = discord.ui.TextInput(label="Number of winners", max_length=3, default="1")
+        self.required_roles_input = discord.ui.TextInput(
+            label="Required roles (optional)", required=False,
+            placeholder="@Role1, @Role2 or role IDs, comma separated"
+        )
+        self.blocked_roles_input = discord.ui.TextInput(
+            label="Blocked roles (optional)", required=False,
+            placeholder="@Role1, @Role2 or role IDs, comma separated"
+        )
+        for item in [self.prize_input, self.duration_input, self.winners_input,
+                     self.required_roles_input, self.blocked_roles_input]:
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            duration_minutes = int(self.duration_input.value.strip())
+            if duration_minutes < 1:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("❌ Duration must be a whole number of minutes (1 or more).", ephemeral=True)
+            return
+
+        try:
+            winners_count = max(1, int(self.winners_input.value.strip()))
+        except ValueError:
+            winners_count = 1
+
+        required_roles = parse_roles(interaction.guild, self.required_roles_input.value)
+        blocked_roles = parse_roles(interaction.guild, self.blocked_roles_input.value)
+
+        await interaction.response.send_modal(
+            GiveawayAppearanceModal(
+                prize=self.prize_input.value,
+                duration_minutes=duration_minutes,
+                winners_count=winners_count,
+                host=self.host,
+                required_role_ids=[r.id for r in required_roles],
+                blocked_role_ids=[r.id for r in blocked_roles],
+            )
+        )
+
+
+class GiveawayAppearanceModal(discord.ui.Modal, title="Create Giveaway — Appearance"):
     def __init__(self, prize: str, duration_minutes: int, winners_count: int, host: discord.Member,
-                 required_role: discord.Role = None, blocked_role: discord.Role = None):
+                 required_role_ids: list, blocked_role_ids: list):
         super().__init__()
         self.prize = prize
         self.duration_minutes = duration_minutes
         self.winners_count = winners_count
         self.host = host
-        self.required_role = required_role
-        self.blocked_role = blocked_role
+        self.required_role_ids = required_role_ids
+        self.blocked_role_ids = blocked_role_ids
 
         self.title_input = discord.ui.TextInput(
             label="Title", required=False, max_length=256, default="🎉 GIVEAWAY 🎉"
@@ -1027,10 +1181,10 @@ class GiveawayEmbedModal(discord.ui.Modal, title="Customize Giveaway Embed"):
         embed.add_field(name="Time Remaining", value=discord.utils.format_dt(ends_at, "R"))
         embed.add_field(name="Entries", value="0")
         embed.add_field(name="Hosted by", value=self.host.mention)
-        if self.required_role:
-            embed.add_field(name="Required Role", value=self.required_role.mention)
-        if self.blocked_role:
-            embed.add_field(name="Blocked Role", value=self.blocked_role.mention)
+        if self.required_role_ids:
+            embed.add_field(name="Required Roles", value=", ".join(f"<@&{rid}>" for rid in self.required_role_ids), inline=False)
+        if self.blocked_role_ids:
+            embed.add_field(name="Blocked Roles", value=", ".join(f"<@&{rid}>" for rid in self.blocked_role_ids), inline=False)
         embed.set_footer(text="Click the button to enter — click again to leave")
 
         view = GiveawayView(
@@ -1038,8 +1192,8 @@ class GiveawayEmbedModal(discord.ui.Modal, title="Customize Giveaway Embed"):
             winners_count=self.winners_count,
             host=self.host,
             ends_at=ends_at,
-            required_role_id=self.required_role.id if self.required_role else None,
-            blocked_role_id=self.blocked_role.id if self.blocked_role else None,
+            required_role_ids=self.required_role_ids,
+            blocked_role_ids=self.blocked_role_ids,
         )
         await interaction.response.send_message(embed=embed, view=view)
         view.message = await interaction.original_response()
@@ -1048,33 +1202,10 @@ class GiveawayEmbedModal(discord.ui.Modal, title="Customize Giveaway Embed"):
         view.schedule_end()
 
 
-@bot.tree.command(name="giveaway", description="Start a giveaway")
-@app_commands.describe(
-    prize="What you're giving away",
-    duration_minutes="How long the giveaway lasts, in minutes",
-    winners="Number of winners (default 1)",
-    required_role="Only members with this role can enter (optional)",
-    blocked_role="Members with this role cannot enter (optional)"
-)
+@bot.tree.command(name="giveaway", description="Start a giveaway — opens a form to fill everything in")
 @app_commands.checks.has_permissions(manage_guild=True)
-async def giveaway(
-    interaction: discord.Interaction,
-    prize: str,
-    duration_minutes: app_commands.Range[int, 1, 10080],
-    winners: app_commands.Range[int, 1, 20] = 1,
-    required_role: discord.Role = None,
-    blocked_role: discord.Role = None
-):
-    await interaction.response.send_modal(
-        GiveawayEmbedModal(
-            prize=prize,
-            duration_minutes=duration_minutes,
-            winners_count=winners,
-            host=interaction.user,
-            required_role=required_role,
-            blocked_role=blocked_role
-        )
-    )
+async def giveaway(interaction: discord.Interaction):
+    await interaction.response.send_modal(GiveawayDetailsModal(host=interaction.user))
 
 
 async def resolve_giveaway_from_url(interaction: discord.Interaction, url: str):
@@ -1111,8 +1242,8 @@ async def resolve_giveaway_from_url(interaction: discord.Interaction, url: str):
     prize="New prize (optional)",
     winners="New number of winners (optional)",
     add_minutes="Add minutes to the remaining time — use a negative number to reduce it (optional)",
-    required_role="Set the required role (optional)",
-    blocked_role="Set the blocked role (optional)"
+    required_roles="Replace the required roles — comma separated mentions or IDs (optional)",
+    blocked_roles="Replace the blocked roles — comma separated mentions or IDs (optional)"
 )
 @app_commands.checks.has_permissions(manage_guild=True)
 async def edit_giveaway(
@@ -1121,8 +1252,8 @@ async def edit_giveaway(
     prize: str = None,
     winners: app_commands.Range[int, 1, 20] = None,
     add_minutes: int = None,
-    required_role: discord.Role = None,
-    blocked_role: discord.Role = None
+    required_roles: str = None,
+    blocked_roles: str = None
 ):
     view, message, error = await resolve_giveaway_from_url(interaction, url)
     if error:
@@ -1133,7 +1264,7 @@ async def edit_giveaway(
         await interaction.response.send_message("❌ This giveaway has already ended — use `/giveaway-reroll` instead.", ephemeral=True)
         return
 
-    if prize is None and winners is None and add_minutes is None and required_role is None and blocked_role is None:
+    if prize is None and winners is None and add_minutes is None and required_roles is None and blocked_roles is None:
         await interaction.response.send_message("⚠️ Provide at least one field to change.", ephemeral=True)
         return
 
@@ -1155,13 +1286,19 @@ async def edit_giveaway(
         action = "Added" if add_minutes > 0 else "Removed"
         changes.append(f"{action} {abs(add_minutes)} minute(s) — new end time updated")
 
-    if required_role:
-        view.required_role_id = required_role.id
-        changes.append(f"Required role → {required_role.mention}")
+    new_required_roles = None
+    if required_roles is not None:
+        new_required_roles = parse_roles(interaction.guild, required_roles)
+        view.required_role_ids = {r.id for r in new_required_roles}
+        mentions = ", ".join(r.mention for r in new_required_roles) if new_required_roles else "None"
+        changes.append(f"Required roles → {mentions}")
 
-    if blocked_role:
-        view.blocked_role_id = blocked_role.id
-        changes.append(f"Blocked role → {blocked_role.mention}")
+    new_blocked_roles = None
+    if blocked_roles is not None:
+        new_blocked_roles = parse_roles(interaction.guild, blocked_roles)
+        view.blocked_role_ids = {r.id for r in new_blocked_roles}
+        mentions = ", ".join(r.mention for r in new_blocked_roles) if new_blocked_roles else "None"
+        changes.append(f"Blocked roles → {mentions}")
 
     field_names = [f.name for f in embed.fields]
     for i, field in enumerate(embed.fields):
@@ -1169,15 +1306,15 @@ async def edit_giveaway(
             embed.set_field_at(i, name="Winners", value=str(view.winners_count), inline=field.inline)
         elif field.name == "Time Remaining":
             embed.set_field_at(i, name="Time Remaining", value=discord.utils.format_dt(view.ends_at, "R"), inline=field.inline)
-        elif field.name == "Required Role" and required_role:
-            embed.set_field_at(i, name="Required Role", value=required_role.mention, inline=field.inline)
-        elif field.name == "Blocked Role" and blocked_role:
-            embed.set_field_at(i, name="Blocked Role", value=blocked_role.mention, inline=field.inline)
+        elif field.name == "Required Roles" and new_required_roles is not None:
+            embed.set_field_at(i, name="Required Roles", value=", ".join(r.mention for r in new_required_roles) or "None", inline=field.inline)
+        elif field.name == "Blocked Roles" and new_blocked_roles is not None:
+            embed.set_field_at(i, name="Blocked Roles", value=", ".join(r.mention for r in new_blocked_roles) or "None", inline=field.inline)
 
-    if required_role and "Required Role" not in field_names:
-        embed.add_field(name="Required Role", value=required_role.mention)
-    if blocked_role and "Blocked Role" not in field_names:
-        embed.add_field(name="Blocked Role", value=blocked_role.mention)
+    if new_required_roles and "Required Roles" not in field_names:
+        embed.add_field(name="Required Roles", value=", ".join(r.mention for r in new_required_roles), inline=False)
+    if new_blocked_roles and "Blocked Roles" not in field_names:
+        embed.add_field(name="Blocked Roles", value=", ".join(r.mention for r in new_blocked_roles), inline=False)
 
     await message.edit(embed=embed)
     await interaction.response.send_message("✅ Giveaway updated:\n" + "\n".join(changes))
