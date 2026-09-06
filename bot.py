@@ -3,6 +3,7 @@ import re
 import json
 import random
 import asyncio
+from datetime import timedelta
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -154,7 +155,7 @@ async def unban(interaction: discord.Interaction, user_id: str):
 @app_commands.describe(member="Member to timeout", minutes="Duration in minutes", reason="Reason")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def timeout(interaction: discord.Interaction, member: discord.Member, minutes: int, reason: str = "Not specified"):
-    duration = discord.utils.utcnow() + discord.timedelta(minutes=minutes)
+    duration = discord.utils.utcnow() + timedelta(minutes=minutes)
     await member.timeout(duration, reason=reason)
     embed = discord.Embed(title="🔇 Member Timed Out", description=f"**{member}** was timed out for {minutes} minute(s).", color=discord.Color.gold())
     embed.add_field(name="Reason", value=reason)
@@ -329,7 +330,7 @@ async def account_age(interaction: discord.Interaction, member: discord.Member =
 @app_commands.describe(hours="How many hours back to check (default 24)")
 @app_commands.checks.has_permissions(moderate_members=True)
 async def recent_joins(interaction: discord.Interaction, hours: app_commands.Range[int, 1, 168] = 24):
-    cutoff = discord.utils.utcnow() - discord.timedelta(hours=hours)
+    cutoff = discord.utils.utcnow() - timedelta(hours=hours)
     members = [m for m in interaction.guild.members if m.joined_at and m.joined_at > cutoff]
     members.sort(key=lambda m: m.joined_at, reverse=True)
 
@@ -829,7 +830,7 @@ async def giveaway(
     duration_minutes: app_commands.Range[int, 1, 10080],
     winners: app_commands.Range[int, 1, 20] = 1
 ):
-    ends_at = discord.utils.utcnow() + discord.timedelta(minutes=duration_minutes)
+    ends_at = discord.utils.utcnow() + timedelta(minutes=duration_minutes)
 
     embed = discord.Embed(
         title="🎉 Giveaway 🎉",
